@@ -147,8 +147,8 @@ function numericnstoich(mtrs::Vector{Pair{V,W}}, statetoid) where {V,W}
 end
 
 # assemble a numeric MassActionJump from a MT MassActionJump representing one rx.
-function assemble_maj(maj::MassActionJump, statetoid, subber, invttype)
-    rval = subber(maj.scaled_rates)
+function assemble_maj(maj::MassActionJump, statetoid, parammap, invttype)
+    rval = substitute(maj.scaled_rates, parammap)
     rs   = numericrstoich(maj.reactant_stoch, statetoid)
     ns   = numericnstoich(maj.net_stoch, statetoid)
     maj  = MassActionJump(convert(invttype, value(rval)), rs, ns, scale_rates = false)
@@ -258,10 +258,9 @@ function DiffEqJump.JumpProblem(js::JumpSystem, prob, aggregator; kwargs...)
 
     # handling parameter substition and empty param vecs
     p = (prob.p == DiffEqBase.NullParameters()) ? Num[] : prob.p
-    parammap  = map((x,y)->Pair(x,y), parameters(js), p)
-    subber    = substituter(parammap)
+    parammap  = Dict(value(x) => value(y) for (x, y) in zip(parameters(js), p))
 
-    majs = MassActionJump[assemble_maj(j, statetoid, subber, invttype) for j in eqs.x[1]]
+    majs = MassActionJump[assemble_maj(j, statetoid, parammap, invttype) for j in eqs.x[1]]
     crjs = ConstantRateJump[assemble_crj(js, j, statetoid) for j in eqs.x[2]]
     vrjs = VariableRateJump[assemble_vrj(js, j, statetoid) for j in eqs.x[3]]
     ((prob isa DiscreteProblem) && !isempty(vrjs)) && error("Use continuous problems such as an ODEProblem or a SDEProblem with VariableRateJumps")
@@ -282,30 +281,30 @@ end
 
 
 ### Functions to determine which states a jump depends on
-function get_variables!(dep, jump::Union{ConstantRateJump,VariableRateJump}, variables)
+function get_variables!(dep, jump::Union{ConstantRateJump,VariableRateJump}, variables::AbstractSet)
     (jump.rate isa Symbolic) && get_variables!(dep, jump.rate, variables)
     dep
 end
 
-function get_variables!(dep, jump::MassActionJump, variables)
+function get_variables!(dep, jump::MassActionJump, variables::AbstractSet)
     sr = value(jump.scaled_rates)
     (sr isa Symbolic) && get_variables!(dep, sr, variables)
     for varasop in jump.reactant_stoch
-        any(isequal(varasop[1]), variables) && push!(dep, varasop[1])
+        varasop[1] in variables && push!(dep, varasop[1])
     end
     dep
 end
 
 ### Functions to determine which states are modified by a given jump
-function modified_states!(mstates, jump::Union{ConstantRateJump,VariableRateJump}, sts)
+function modified_states!(mstates, jump::Union{ConstantRateJump,VariableRateJump}, sts::AbstractSet)
     for eq in jump.affect!
         st = eq.lhs
-        any(isequal(st), sts) && push!(mstates, st)
+        st in sts && push!(mstates, st)
     end
 end
 
-function modified_states!(mstates, jump::MassActionJump, sts)
+function modified_states!(mstates, jump::MassActionJump, sts::AbstractSet)
     for (state,stoich) in jump.net_stoch
-        any(isequal(state), sts) && push!(mstates, state)
+        state in sts && push!(mstates, state)
     end
 end

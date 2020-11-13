@@ -68,7 +68,12 @@ get_variables!(vars, e::Number, varlist=nothing) = vars
 
 function get_variables!(vars, e::Symbolic, varlist=nothing)
     if is_singleton(e)
-        if isnothing(varlist) || any(isequal(e), varlist)
+        if !isnothing(varlist)
+            @assert varlist isa AbstractSet
+            if e in varlist
+                push!(vars, e)
+            end
+        else
             push!(vars, e)
         end
     else
@@ -89,22 +94,14 @@ modified_states!(mstates, e::Equation, statelist=nothing) = get_variables!(mstat
 # variable substitution
 # Piracy but mild
 """
-substitute(expr, s::Pair)
-substitute(expr, s::Dict)
-substitute(expr, s::Vector)
+substitute(expr::Num, s::Dict)
 
-Performs the substitution `Num => val` on the `expr` Num.
+Substitute all keys of `s` appearing in `expr` with the corresponding values.
+
+Note that the dictionary may not itself contain `Num`, construct it after unwrapping
+with `value`.
 """
-substitute(expr::Num, s::Union{Pair, Vector, Dict}; kw...) = Num(substituter(s)(value(expr); kw...))
-# TODO: move this to SymbolicUtils
-substitute(expr::Term, s::Pair; kw...) = substituter([s[1] => s[2]])(expr; kw...)
-substitute(expr::Term, s::Vector; kw...) = substituter(s)(expr; kw...)
-
-substituter(pair::Pair) = substituter((pair,))
-function substituter(pairs)
-    dict = Dict(to_symbolic(k) => to_symbolic(v)  for (k, v) in pairs)
-    (expr; kw...) -> SymbolicUtils.substitute(expr, dict; kw...)
-end
+substitute(expr::Num, s::Dict; kw...) = Num(substitute(value(expr), s; kw...))
 
 macro showarr(x)
     n = string(x)
