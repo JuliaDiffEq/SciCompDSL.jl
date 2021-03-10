@@ -1,3 +1,5 @@
+import Symbolics: ClosureExpr
+
 function torn_system_jacobian_sparsity(sys)
     s = structure(sys)
     @unpack fullvars, graph, partitions = s
@@ -123,7 +125,7 @@ function partitions_dag(s::SystemStructure)
     sparse(I, J, true, n, n)
 end
 
-function gen_nlsolve(sys, eqs, vars)
+function gen_nlsolve(sys, eqs, vars, destructure=true)
     @assert !isempty(vars)
     @assert length(eqs) == length(vars)
     rhss = map(x->x.rhs, eqs)
@@ -139,9 +141,9 @@ function gen_nlsolve(sys, eqs, vars)
     u0 = isscalar ? u0[1] : SVector(u0...)
 
     fname = gensym("fun")
+    statearg = DestructuredArgs(vars)
     f = Func(
-        [
-         DestructuredArgs(vars)
+        [statearg,
          DestructuredArgs(params)
         ],
         [],
@@ -158,13 +160,15 @@ function gen_nlsolve(sys, eqs, vars)
                               )
         end)
 
-    [
-     fname ← @RuntimeGeneratedFunction(f)
-     DestructuredArgs(vars) ← solver_call
-    ]
+    Dict(:solve_params => params,
+         :solve_vars => vars,
+         :u0 => u0,
+         :function_def => fname ← @RuntimeGeneratedFunction(f),
+         :output_type => LiteralExpr(:(typeof($u0))),
+         :solver_call => solver_call)
 end
 
-function get_torn_eqs_vars(sys)
+function get_torn_eqs_vars(sys, parallelize)
     s = structure(sys)
     partitions = s.partitions
     vars = s.fullvars
@@ -173,7 +177,61 @@ function get_torn_eqs_vars(sys)
     torn_eqs  = map(idxs-> eqs[idxs], map(x->x[3], partitions))
     torn_vars = map(idxs->vars[idxs], map(x->x[4], partitions))
 
-    gen_nlsolve.((sys,), torn_eqs, torn_vars)
+    if parallelize
+        dag = partitions_dag(s)
+        spawned = Set{Int}()
+        assigns = []
+        while length(spawned) < size(dag, 2)
+            next = findall(1:size(dag, 2)) do i
+                !(i in spawned) && iszero(dag[:, i])
+            end
+            isempty(next) && error("Cannot parallelize")
+
+            union!(spawned, next)
+
+            dag[next, :] .= false
+
+            nlsolves = gen_nlsolve.((sys,),
+                                 torn_eqs[next],
+                                 torn_vars[next],
+                                 false)
+
+            @show length(nlsolves)
+
+            nt = Base.Threads.nthreads()
+            batches = map(Iterators.partition(nlsolves, nt)) do batch
+                params = reduce(union,
+                                map(s->s[:solve_params],
+                                    batch), init=[])
+                solvercalls = map(s->s[:solver_call], batch)
+
+                batchexpr = Let(map(s->s[:function_def],
+                                    batch),
+                    LiteralExpr(:(tuple($(solvercalls...)))))
+
+
+                ot = LiteralExpr(
+                    :(Tuple{$(map(s->s[:output_type],
+                                  batch)...)}))
+                ClosureExpr(
+                    Func(params, [], batchexpr), params, ot)
+            end
+
+            varbatches = collect(Iterators.partition(map(DestructuredArgs, torn_vars[next]), nt))
+            assign = DestructuredArgs(map(DestructuredArgs,
+                                          varbatches)) ←
+                SpawnFetch{MultithreadedForm}(batches, tuple)
+
+
+            push!(assigns, assign)
+        end
+        return assigns
+    end
+
+    map(gen_nlsolve.((sys,), torn_eqs, torn_vars)) do s
+        [s[:function_def],
+         DestructuredArgs(s[:solve_vars]) ← s[:solver_call]]
+    end |> Iterators.flatten |> collect
 end
 
 function build_torn_function(
@@ -181,6 +239,7 @@ function build_torn_function(
         expression=false,
         jacobian_sparsity=true,
         checkbounds=false,
+        threaded=false,
         kw...
     )
 
@@ -189,14 +248,49 @@ function build_torn_function(
         isdiffeq(eq) && push!(rhss, eq.rhs)
     end
 
-    out = Sym{Any}(gensym("out"))
-    odefunbody = SetArray(
-        checkbounds,
-        out,
-        rhss
-    )
-
     s = structure(sys)
+
+    out = Sym{Any}(gensym("out"))
+
+
+    #=
+    ps = vcat(parameters(sys),
+              s.fullvars[diffvars_range(s)],
+              s.fullvars[algvars_range(s)])
+
+    Js = Symbolics.jacobian_sparsity(rhss, ps)
+    idxs = findall(x->x>0, vec(sum(Js, dims=1)))
+
+    closed_args = vcat(ps[idxs], [independent_variable(sys)])
+    @show closed_args
+    =#
+    ps = parameters(sys)
+
+    Js = Symbolics.jacobian_sparsity(rhss, ps)
+    idxs = findall(x->x>0, vec(sum(Js, dims=1)))
+
+    closed_args = vcat(s.fullvars[diffvars_range(s)],
+                       s.fullvars[algvars_range(s)],
+                       ps[idxs], [independent_variable(sys)])
+
+    if threaded
+        odefunbody = Symbolics.set_array(
+            MultithreadedForm(Threads.nthreads()),
+            closed_args,
+            out,
+            nothing, # outputidxs
+            rhss,
+            false, # checkbounds
+            true   # skipzeros
+        )
+    else
+        odefunbody = SetArray(
+            !checkbounds,
+            out,
+            map(Symbolics.unflatten_long_ops, rhss)
+        )
+    end
+
     states = s.fullvars[diffvars_range(s)]
     syms = map(Symbol, states)
 
@@ -205,16 +299,19 @@ function build_torn_function(
              [
               out
               DestructuredArgs(states)
-              DestructuredArgs(parameters(sys))
+              DestructuredArgs(ps)
               independent_variable(sys)
              ],
              [],
              Let(
-                 collect(Iterators.flatten(get_torn_eqs_vars(sys))),
+                 get_torn_eqs_vars(sys, threaded),
                  odefunbody
                 )
             )
     )
+    if isdefined(Main, :_debug_expr)
+        Main._debug_expr[] = expr
+    end
     if expression
         expr
     else
@@ -229,7 +326,7 @@ function build_torn_function(
 
         ODEFunction{true}(
                           @RuntimeGeneratedFunction(expr),
-                          sparsity = torn_system_jacobian_sparsity(sys),
+                          sparsity = jacobian_sparsity ? torn_system_jacobian_sparsity(sys) : nothing,
                           syms = syms,
                           observed = observedfun,
                          )
@@ -295,6 +392,11 @@ function build_observed_function(
         solves = gen_nlsolve.((sys,), torn_eqs, torn_vars)
     else
         solves = []
+    end
+
+    solves = map(solves) do s
+        [s[:function_def],
+         DestructuredArgs(s[:solve_vars]) ← s[:solver_call]]
     end
 
     output = map(syms) do sym
